@@ -19,6 +19,7 @@ import numpy as np
 import time
 import logging
 import sys
+import re
 from importlib import import_module
 __dir__ = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.abspath(os.path.join(__dir__, '..')))
@@ -28,9 +29,6 @@ from paddle.io import DistributedBatchSampler, DataLoader
 import argparse
 from paddle.inference import Config
 from paddle.inference import create_predictor
-import pynvml
-import psutil
-import GPUtil
 
 
 def parse_args():
@@ -42,22 +40,42 @@ def parse_args():
     parser.add_argument("--data_dir", type=str)
     parser.add_argument("--reader_file", type=str)
     parser.add_argument("--batchsize", type=int)
-    parser.add_argument("--model_name", type=str, default="not specified")
+    parser.add_argument("--model_name", type=str, default="rec_model")
     parser.add_argument("--cpu_threads", type=int, default=1)
     parser.add_argument("--enable_mkldnn", type=str, default="False")
     parser.add_argument("--enable_tensorRT", type=str, default="False")
+    parser.add_argument("--benchmark", type=str, default="True")
+    parser.add_argument("--save_log_path", type=str, default="./output")
+    parser.add_argument("--precision", type=str)
     args = parser.parse_args()
     args.use_gpu = (True if args.use_gpu.lower() == "true" else False)
     args.enable_mkldnn = (True
                           if args.enable_mkldnn.lower() == "true" else False)
     args.enable_tensorRT = (True if args.enable_tensorRT.lower() == "true" else
                             False)
+    args.benchmark = (True if args.benchmark.lower() == "true" else False)
     return args
 
 
 def init_predictor(args):
     if args.model_dir:
-        config = Config(args.model_dir)
+        has_model = 0
+        pdmodel_name = 0
+        pdiparams_name = 0
+        for file_name in os.listdir(args.model_dir):
+            if re.search("__model__", file_name):
+                has_model = 1
+            if file_name.endswith(".pdmodel"):
+                pdmodel_name = os.path.join(args.model_dir, file_name)
+            if file_name.endswith(".pdiparams"):
+                pdiparams_name = os.path.join(args.model_dir, file_name)
+        if has_model == 1:
+            config = Config(args.model_dir)
+        elif pdmodel_name and pdiparams_name:
+            config = Config(pdmodel_name, pdiparams_name)
+        else:
+            raise ValueError(
+                "config setting error, please check your model path")
     else:
         config = Config(args.model_file, args.params_file)
 
@@ -66,16 +84,16 @@ def init_predictor(args):
         if args.enable_tensorRT:
             config.enable_tensorrt_engine(
                 max_batch_size=args.batchsize,
-                min_subgraph_size=1,
+                min_subgraph_size=9,
                 precision_mode=paddle.inference.PrecisionType.Float32)
     else:
         config.disable_gpu()
-        # config.delete_pass("repeated_fc_relu_fuse_pass")
+        config.delete_pass("repeated_fc_relu_fuse_pass")
         config.set_cpu_math_library_num_threads(args.cpu_threads)
         if args.enable_mkldnn:
             config.enable_mkldnn()
     predictor = create_predictor(config)
-    return predictor
+    return predictor, config
 
 
 def create_data_loader(args):
@@ -88,131 +106,64 @@ def create_data_loader(args):
     sys.path.append(reader_path)
     #sys.path.append(os.path.abspath("."))
     reader_class = import_module(reader_file)
-    dataset = reader_class.RecDataset(file_list, config=None)
+    config = {"runner.inference": True}
+    dataset = reader_class.RecDataset(file_list, config=config)
     loader = DataLoader(
         dataset, batch_size=batchsize, places=place, drop_last=True)
     return loader
 
 
-def log_print(args, results_type, num_test_data, average_preprocess_time,
-              average_inference_time, average_postprocess_time, cpu_rss,
-              gpu_rss, gpu_util):
-    print("----------------------- Model info ----------------------")
-    print("model_name: {}\ntype: {}\nmodel_sorce: {}".format(
-        args.model_name, "static", "PaddleRec"))
-    print("----------------------- Data info -----------------------")
-    print("batch_size: {}".format(args.batchsize))
-    print("----------------------- Conf info -----------------------")
-    print("runtime_device: {}".format("gpu" if args.use_gpu else "cpu"))
-    print("ir_optim: {}\nenable_memory_optim: {}\nenable_tensorrt: {}".format(
-        "False", "False", args.enable_tensorRT))
-    print("precision: {}".format([str(x).split(".")[1] for x in results_type]))
-    print("enable_mkldnn: {}\ncpu_math_library_num_threads: {}".format(
-        args.enable_mkldnn, args.cpu_threads))
-    print("----------------------- Perf info -----------------------")
-    print(
-        "preprocess_time(ms): {}\ninference_time(ms): {}\npostprocess_time(ms): {}".
-        format(average_preprocess_time * 1000, average_inference_time * 1000,
-               average_postprocess_time * 1000))
-    print("The number of predicted data: {}".format(num_test_data))
-    print("total time spend(s): {:.5f}".format(
-        (average_preprocess_time + average_inference_time +
-         average_postprocess_time) * num_test_data))
-    print("cpu_rss(MB): {}, gpu_rss(MB): {}".format(cpu_rss, gpu_rss))
-    print("gpu_util: {}%".format(str(gpu_util * 100)[:4]))
-
-
-class Times(object):
-    def __init__(self):
-        self.time = 0.
-        self.st = 0.
-        self.et = 0.
-
-    def start(self):
-        self.st = time.time()
-
-    def end(self, accumulative=True):
-        self.et = time.time()
-        if accumulative:
-            self.time += self.et - self.st
-        else:
-            self.time = self.et - self.st
-
-    def reset(self):
-        self.time = 0.
-        self.st = 0.
-        self.et = 0.
-
-    def value(self):
-        return round(self.time, 4)
-
-
-def get_current_memory_mb(gpu_id=None):
-    pid = os.getpid()
-    p = psutil.Process(pid)
-    info = p.memory_full_info()
-    cpu_mem = info.uss / 1024. / 1024.
-    gpu_mem = 0
-    gpu_precent = 0
-    if gpu_id is not None:
-        GPUs = GPUtil.getGPUs()
-        gpu_load = GPUs[gpu_id].load
-        gpu_precent = gpu_load
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        gpu_mem = meminfo.used / 1024. / 1024.
-    return cpu_mem, gpu_mem, gpu_precent
-
-
 def main(args):
-    predictor = init_predictor(args)
+    predictor, pred_config = init_predictor(args)
     place = paddle.set_device('gpu' if args.use_gpu else 'cpu')
     args.place = place
     input_names = predictor.get_input_names()
     output_names = predictor.get_output_names()
     test_dataloader = create_data_loader(args)
-    preprocess_time = Times()
-    inference_time = Times()
-    postprocess_time = Times()
-    cpu_mem, gpu_mem = 0, 0
-    gpu_id = 0
-    gpu_util = 0
+
+    if args.benchmark:
+        import auto_log
+        pid = os.getpid()
+        autolog = auto_log.AutoLogger(
+            model_name=args.model_name,
+            model_precision=args.precision,
+            batch_size=args.batchsize,
+            data_shape="dynamic",
+            save_path=args.save_log_path,
+            inference_config=pred_config,
+            pids=pid,
+            process_name=None,
+            gpu_ids=0,
+            time_keys=[
+                'preprocess_time', 'inference_time', 'postprocess_time'
+            ])
+
     for batch_id, batch_data in enumerate(test_dataloader):
         name_data_pair = dict(zip(input_names, batch_data))
-        preprocess_time.start()
+        if args.benchmark:
+            autolog.times.start()
         for name in input_names:
             input_tensor = predictor.get_input_handle(name)
             input_tensor.copy_from_cpu(name_data_pair[name].numpy())
-        preprocess_time.end(accumulative=True)
-        inference_time.start()
+        if args.benchmark:
+            autolog.times.stamp()
         predictor.run()
-        inference_time.end(accumulative=True)
-        results = []
-        results_type = []
-        postprocess_time.start()
         for name in output_names:
             output_tensor = predictor.get_output_handle(name)
-            results_type.append(output_tensor.type())
             output_data = output_tensor.copy_to_cpu()
+        results = []
+        results_type = []
+        if args.benchmark:
+            autolog.times.stamp()
+        for name in output_names:
+            results_type.append(output_tensor.type())
             results.append(output_data[0])
-        postprocess_time.end(accumulative=True)
-        cm, gm, gu = get_current_memory_mb(gpu_id)
-        cpu_mem += cm
-        gpu_mem += gm
-        gpu_util += gu
+        if args.benchmark:
+            autolog.times.end(stamp=True)
         print(results)
 
-    num_test_data = args.batchsize * (batch_id + 1)
-    average_preprocess_time = preprocess_time.value() / num_test_data
-    average_inference_time = inference_time.value() / num_test_data
-    average_postprocess_time = postprocess_time.value() / num_test_data
-    cpu_rss = cpu_mem / (batch_id + 1)
-    gpu_rss = gpu_mem / (batch_id + 1)
-    gpu_util = gpu_util / (batch_id + 1)
-    log_print(args, results_type, num_test_data, average_preprocess_time,
-              average_inference_time, average_postprocess_time, cpu_rss,
-              gpu_rss, gpu_util)
+    if args.benchmark:
+        autolog.report()
 
 
 if __name__ == '__main__':
