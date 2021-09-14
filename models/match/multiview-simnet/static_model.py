@@ -14,7 +14,7 @@
 
 import math
 import paddle
-from net import MultiviewSimnetLayer
+from .net import MultiviewSimnetLayer
 
 
 class StaticModel():

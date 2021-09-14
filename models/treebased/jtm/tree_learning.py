@@ -25,7 +25,7 @@ import json
 import time
 import math
 import argparse
-from user_preference import UserPreferenceModel
+from .user_preference import UserPreferenceModel
 
 paddle.enable_static()
 

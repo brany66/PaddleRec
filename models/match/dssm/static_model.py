@@ -14,7 +14,7 @@
 
 import math
 import paddle
-from net import DSSMLayer
+from .net import DSSMLayer
 
 
 class StaticModel():

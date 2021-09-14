@@ -20,7 +20,8 @@ import sys
 import os
 tdm_path = os.path.abspath(os.path.join(os.path.dirname(os.getcwd()), "tdm"))
 sys.path.append(tdm_path)
-from model import dnn_model_define
+from treebased.tdm.model import dnn_model_define
+# from model import dnn_model_define
 from paddle.fluid.framework import Program
 
 

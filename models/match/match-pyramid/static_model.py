@@ -14,7 +14,7 @@
 
 import math
 import paddle
-from net import MatchPyramidLayer
+from .net import MatchPyramidLayer
 
 
 class StaticModel():

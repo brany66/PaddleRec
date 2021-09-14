@@ -15,7 +15,7 @@
 import math
 import paddle
 
-from model import dnn_model_define
+from .model import dnn_model_define
 
 
 class StaticModel():

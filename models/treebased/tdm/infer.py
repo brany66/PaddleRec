@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from model import dnn_model_define
+from .model import dnn_model_define
 import paddle
 import paddle.fluid as fluid
 import os
